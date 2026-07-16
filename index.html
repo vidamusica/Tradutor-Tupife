@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="Tradutor e transpositor da notação numérica Tupife para pífanos — Dó, Sol e Ré." />
+<title>Tradutor Tupife</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body, #root { margin: 0; padding: 0; min-height: 100%; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  textarea, button { font-family: inherit; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module">
+const { useState, useMemo } = React;
+
+// ============================================================
+// Sistema Tupife — lógica musical
+// ============================================================
+
+const DIG_SEMITOM = {
+  "6": 0, "6)": 1, "5": 2, "5)": 3, "4": 4,
+  "3": 5, "3)": 6, "2": 7, "2)": 8, "1": 9,
+  "1)": 10, "0": 11,
+};
+const SEMITOM_DIG = Object.fromEntries(
+  Object.entries(DIG_SEMITOM).map(([d, s]) => [s, d])
+);
+
+const PIFES = {
+  C: { nome: "Pife em Dó", curto: "Dó", fundamental: 72 },
+  G: { nome: "Pife em Sol", curto: "Sol", fundamental: 67 },
+  D: { nome: "Pife em Ré", curto: "Ré", fundamental: 62 },
+};
+
+const NOMES_PT = ["Dó", "Dó#", "Ré", "Ré#", "Mi", "Fá", "Fá#", "Sol", "Sol#", "Lá", "Lá#", "Si"];
+const SOLFEJO = {
+  do: 0, "dó": 0, re: 2, "ré": 2, mi: 4, fa: 5, "fá": 5,
+  sol: 7, la: 9, "lá": 9, si: 11,
+  c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11,
+};
+
+function parseDigitacoes(texto) {
+  const tokens = texto.trim().split(/[\s,;\-–—]+/).filter(Boolean);
+  return tokens.map((tok) => {
+    if (tok === "~") return { tipo: "sust", raw: "~" };
+    const m = tok.match(/^([0-6])(\))?('{0,2})$/);
+    if (!m) return { tipo: "erro", raw: tok };
+    const dig = m[1] + (m[2] || "");
+    if (!(dig in DIG_SEMITOM)) return { tipo: "erro", raw: tok };
+    const oitava = m[3].length;
+    return { tipo: "dig", dig, oitava, raw: tok };
+  });
+}
+
+function parseNotas(texto) {
+  const tokens = texto.trim().split(/[\s,;\-–—]+/).filter(Boolean);
+  return tokens.map((tok) => {
+    if (tok === "~") return { tipo: "sust", raw: "~" };
+    const m = tok.match(/^([a-zA-ZáéóÁÉÓ]+)([#b]?)('{0,2})$/);
+    if (!m) return { tipo: "erro", raw: tok };
+    const nomeBase = m[1];
+    const chave = nomeBase.toLowerCase();
+    if (!(chave in SOLFEJO)) return { tipo: "erro", raw: tok };
+    let pc = SOLFEJO[chave];
+    if (m[2] === "#") pc = (pc + 1) % 12;
+    if (m[2] === "b") pc = (pc + 11) % 12;
+    const maiuscula = nomeBase === nomeBase.toUpperCase() && nomeBase.length > 1;
+    const maiusculaLetra = nomeBase.length === 1 && nomeBase === nomeBase.toUpperCase();
+    const oitavaExtra = (maiuscula || maiusculaLetra ? 1 : 0) + m[3].length;
+    return { tipo: "nota", pc, oitavaExtra, raw: tok };
+  });
+}
+
+function digParaMidi(dig, oitava, pifeKey) {
+  return PIFES[pifeKey].fundamental + DIG_SEMITOM[dig] + oitava * 12;
+}
+
+function midiParaDig(midi, pifeKey) {
+  const offset = midi - PIFES[pifeKey].fundamental;
+  if (offset < 0) return null;
+  const oitava = Math.floor(offset / 12);
+  if (oitava > 2) return null;
+  const semitom = offset % 12;
+  const dig = SEMITOM_DIG[semitom];
+  if (!dig) return null;
+  return dig + "'".repeat(oitava);
+}
+
+function midiParaNome(midi) {
+  return NOMES_PT[midi % 12] + Math.floor(midi / 12 - 1);
+}
+
+const ESCALA_MAIOR = [0, 2, 4, 5, 7, 9, 11];
+function detectarTom(midis) {
+  if (!midis.length) return null;
+  const pcs = midis.map((m) => m % 12);
+  const contagem = {};
+  pcs.forEach((pc) => (contagem[pc] = (contagem[pc] || 0) + 1));
+  let melhor = null;
+  for (let tonica = 0; tonica < 12; tonica++) {
+    const escala = new Set(ESCALA_MAIOR.map((g) => (tonica + g) % 12));
+    let dentro = 0, total = 0;
+    for (const [pc, n] of Object.entries(contagem)) {
+      total += n;
+      if (escala.has(Number(pc))) dentro += n;
+    }
+    let score = dentro / total;
+    const ultima = pcs[pcs.length - 1];
+    if (ultima === tonica) score += 0.08;
+    if (ultima === (tonica + 7) % 12) score += 0.03;
+    if (!melhor || score > melhor.score) melhor = { tonica, score };
+  }
+  if (!melhor) return null;
+  const relMenor = (melhor.tonica + 9) % 12;
+  return {
+    maior: NOMES_PT[melhor.tonica],
+    menor: NOMES_PT[relMenor],
+    cobertura: melhor.score,
+  };
+}
+
+// ============================================================
+// Estilo
+// ============================================================
+const cores = {
+  papel: "#FBF7EE",
+  tinta: "#14213D",
+  caneta: "#1D4E9E",
+  vermelho: "#D62828",
+  amarelo: "#FDC500",
+  cinza: "#8A8578",
+};
+
+function Bandeirinhas() {
+  const cs = [cores.caneta, cores.vermelho, cores.amarelo, "#2A9D8F", cores.caneta, cores.amarelo, cores.vermelho, "#2A9D8F", cores.caneta, cores.amarelo, cores.vermelho, "#2A9D8F", cores.caneta, cores.amarelo];
+  return (
+    <svg viewBox="0 0 700 30" style={{ width: "100%", height: 24, display: "block" }} preserveAspectRatio="none" aria-hidden="true">
+      <line x1="0" y1="2" x2="700" y2="2" stroke={cores.tinta} strokeWidth="2" />
+      {cs.map((c, i) => (
+        <polygon key={i} points={`${i * 50},2 ${i * 50 + 50},2 ${i * 50 + 25},28`} fill={c} opacity="0.9" />
+      ))}
+    </svg>
+  );
+}
+
+function CartaoDig({ dig, nota, erro, sust }) {
+  if (sust)
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "12px 8px", minWidth: 48 }}>
+        <span className="mono" style={{ fontSize: 30, color: cores.cinza }}>~</span>
+        <span style={{ fontSize: 11, marginTop: 4, color: cores.cinza }}>seg.</span>
+      </div>
+    );
+  return (
+    <div style={{
+      display: "flex", flexDirection: "column", alignItems: "center",
+      borderRadius: 8, padding: "8px 12px", minWidth: 56,
+      border: `2px solid ${erro ? cores.vermelho : cores.tinta}`,
+      background: erro ? "#FDECEC" : "#FFFFFF",
+    }}>
+      <span className="mono" style={{ fontSize: 30, fontWeight: 700, lineHeight: 1.1, color: erro ? cores.vermelho : cores.caneta }}>
+        {dig ?? "—"}
+      </span>
+      <span style={{ fontSize: 11, marginTop: 4, fontWeight: 500, color: cores.tinta }}>
+        {erro ? "fora" : nota}
+      </span>
+    </div>
+  );
+}
+
+function BotaoCopiar({ texto }) {
+  const [ok, setOk] = useState(false);
+  return (
+    <button
+      onClick={() => {
+        const ta = document.createElement("textarea");
+        ta.value = texto;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setOk(true);
+        setTimeout(() => setOk(false), 1500);
+      }}
+      style={{
+        fontSize: 12, padding: "4px 12px", borderRadius: 999,
+        border: `1px solid ${cores.tinta}`, fontWeight: 500, cursor: "pointer",
+        background: ok ? cores.amarelo : "transparent", color: cores.tinta,
+      }}
+    >
+      {ok ? "Copiado!" : "Copiar"}
+    </button>
+  );
+}
+
+// ============================================================
+// App principal
+// ============================================================
+function TradutorTupife() {
+  const [modo, setModo] = useState("dig");
+  const [pifeOrigem, setPifeOrigem] = useState("G");
+  const [entrada, setEntrada] = useState("");
+
+  const resultado = useMemo(() => {
+    if (!entrada.trim()) return null;
+
+    if (modo === "dig") {
+      const tokens = parseDigitacoes(entrada);
+      const eventos = tokens.map((t) => {
+        if (t.tipo === "sust") return { sust: true };
+        if (t.tipo === "erro") return { erro: true, raw: t.raw };
+        const midi = digParaMidi(t.dig, t.oitava, pifeOrigem);
+        return { midi, digOrigem: t.raw };
+      });
+      const midis = eventos.filter((e) => e.midi != null).map((e) => e.midi);
+      const tom = detectarTom(midis);
+      const transp = {};
+      for (const k of Object.keys(PIFES)) {
+        if (k === pifeOrigem) continue;
+        transp[k] = eventos.map((e) => {
+          if (e.sust) return { sust: true };
+          if (e.erro) return { erro: true, raw: e.raw };
+          const dig = midiParaDig(e.midi, k);
+          return { dig, midi: e.midi, erro: dig == null };
+        });
+      }
+      return { modo, eventos, tom, transp };
+    } else {
+      const tokens = parseNotas(entrada);
+      const porPife = {};
+      for (const k of Object.keys(PIFES)) {
+        porPife[k] = tokens.map((t) => {
+          if (t.tipo === "sust") return { sust: true };
+          if (t.tipo === "erro") return { erro: true, raw: t.raw };
+          const fund = PIFES[k].fundamental;
+          let midi = fund + ((t.pc - (fund % 12) + 12) % 12);
+          midi += t.oitavaExtra * 12;
+          const dig = midiParaDig(midi, k);
+          return { dig, midi, erro: dig == null };
+        });
+      }
+      const midis = porPife["C"].filter((e) => e.midi != null).map((e) => e.midi);
+      const tom = detectarTom(midis);
+      return { modo, porPife, tom };
+    }
+  }, [entrada, modo, pifeOrigem]);
+
+  const linhaTexto = (evs) =>
+    evs.map((e) => (e.sust ? "~" : e.erro ? "?" : e.dig ?? e.digOrigem)).join(" ");
+
+  const btnBase = {
+    padding: "8px 16px", borderRadius: 999, fontSize: 14, fontWeight: 700,
+    border: `2px solid ${cores.tinta}`, cursor: "pointer",
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: cores.papel, color: cores.tinta }}>
+      <Bandeirinhas />
+      <div style={{ maxWidth: 768, margin: "0 auto", padding: "0 16px 64px" }}>
+        <header style={{ paddingTop: 24, paddingBottom: 16 }}>
+          <h1 style={{ fontSize: 34, fontWeight: 900, letterSpacing: "-0.02em", margin: 0 }}>
+            Tradutor <span style={{ color: cores.caneta }}>Tupife</span>
+          </h1>
+          <p style={{ fontSize: 14, marginTop: 4, color: cores.cinza }}>
+            Digitação numérica para pífanos — traduz e transpõe entre Dó, Sol e Ré
+          </p>
+        </header>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          {[
+            { k: "dig", label: "Digitações → Notas" },
+            { k: "notas", label: "Notas → Digitações" },
+          ].map((op) => (
+            <button
+              key={op.k}
+              onClick={() => setModo(op.k)}
+              style={{
+                ...btnBase,
+                background: modo === op.k ? cores.tinta : "transparent",
+                color: modo === op.k ? cores.papel : cores.tinta,
+              }}
+            >
+              {op.label}
+            </button>
+          ))}
+        </div>
+
+        {modo === "dig" && (
+          <div style={{ marginBottom: 16 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: cores.cinza }}>
+              Pife de origem
+            </span>
+            <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+              {Object.entries(PIFES).map(([k, p]) => (
+                <button
+                  key={k}
+                  onClick={() => setPifeOrigem(k)}
+                  style={{
+                    padding: "8px 16px", borderRadius: 8, fontSize: 14, fontWeight: 700, cursor: "pointer",
+                    border: `2px solid ${cores.caneta}`,
+                    background: pifeOrigem === k ? cores.caneta : "#FFFFFF",
+                    color: pifeOrigem === k ? "#FFFFFF" : cores.caneta,
+                  }}
+                >
+                  {p.curto}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <label style={{ display: "block" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: cores.cinza }}>
+            {modo === "dig"
+              ? "Digite as digitações (ex: 3 2 1 1) 6' ~ )"
+              : "Digite as notas (ex: sol la si DO si la — MAIÚSCULA = oitava acima)"}
+          </span>
+          <textarea
+            value={entrada}
+            onChange={(e) => setEntrada(e.target.value)}
+            rows={3}
+            placeholder={modo === "dig" ? "3 2 1 1) 1 2 3 5 3 2 3 2 ~" : "sol la si DO si la sol mi"}
+            className="mono"
+            style={{
+              marginTop: 4, width: "100%", borderRadius: 8, border: `2px solid ${cores.tinta}`,
+              padding: 12, fontSize: 18, background: "#FFFFFF", color: cores.caneta, resize: "vertical",
+            }}
+          />
+        </label>
+
+        {resultado && (
+          <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 24 }}>
+            {resultado.tom && (
+              <div style={{
+                display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 16px",
+                borderRadius: 999, border: `2px solid ${cores.amarelo}`, background: "#FFF8E1", alignSelf: "flex-start",
+              }}>
+                <span style={{ fontSize: 14, fontWeight: 700 }}>
+                  Tom provável: {resultado.tom.maior} maior
+                  <span style={{ fontWeight: 400, color: cores.cinza }}> (rel. {resultado.tom.menor} menor)</span>
+                </span>
+              </div>
+            )}
+
+            {modo === "dig" && (
+              <>
+                <section>
+                  <h2 style={{ fontWeight: 900, fontSize: 18, marginBottom: 8 }}>
+                    {PIFES[pifeOrigem].nome} — notas que soam
+                  </h2>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {resultado.eventos.map((e, i) =>
+                      e.sust ? <CartaoDig key={i} sust /> :
+                      e.erro ? <CartaoDig key={i} erro dig={e.raw} /> :
+                      <CartaoDig key={i} dig={e.digOrigem} nota={midiParaNome(e.midi)} />
+                    )}
+                  </div>
+                </section>
+
+                {Object.entries(resultado.transp).map(([k, evs]) => (
+                  <section key={k}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <h2 style={{ fontWeight: 900, fontSize: 18, margin: 0 }}>{PIFES[k].nome}</h2>
+                      <BotaoCopiar texto={linhaTexto(evs)} />
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      {evs.map((e, i) =>
+                        e.sust ? <CartaoDig key={i} sust /> :
+                        e.erro ? <CartaoDig key={i} erro dig={e.raw ?? "—"} /> :
+                        <CartaoDig key={i} dig={e.dig} nota={midiParaNome(e.midi)} />
+                      )}
+                    </div>
+                  </section>
+                ))}
+              </>
+            )}
+
+            {modo === "notas" &&
+              Object.entries(resultado.porPife).map(([k, evs]) => (
+                <section key={k}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <h2 style={{ fontWeight: 900, fontSize: 18, margin: 0 }}>{PIFES[k].nome}</h2>
+                    <BotaoCopiar texto={linhaTexto(evs)} />
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {evs.map((e, i) =>
+                      e.sust ? <CartaoDig key={i} sust /> :
+                      e.erro && e.raw ? <CartaoDig key={i} erro dig={e.raw} /> :
+                      e.erro ? <CartaoDig key={i} erro dig="—" /> :
+                      <CartaoDig key={i} dig={e.dig} nota={midiParaNome(e.midi)} />
+                    )}
+                  </div>
+                </section>
+              ))}
+          </div>
+        )}
+
+        <footer style={{ marginTop: 48, paddingTop: 16, borderTop: `2px solid ${cores.tinta}`, fontSize: 12, color: cores.cinza, display: "flex", flexDirection: "column", gap: 4 }}>
+          <p style={{ margin: 0 }}><strong style={{ color: cores.tinta }}>Como escrever:</strong> números 0–6 = furos tapados · <span className="mono">)</span> = forquilha (meio furo) · <span className="mono">'</span> = 2ª oitava · <span className="mono">''</span> = 3ª oitava · <span className="mono">~</span> = sustentação</p>
+          <p style={{ margin: 0 }}><strong style={{ color: cores.tinta }}>Notas:</strong> dó ré mi fá sol lá si (ou c d e f g a b) · <span className="mono">#</span>/<span className="mono">b</span> para acidentes · MAIÚSCULA ou <span className="mono">'</span> = oitava acima</p>
+          <p style={{ margin: 0 }}>Sistema de digitação criado pelo Bloco Tupife — David Gonçalves, Pedro Autran, Victor Lourenço e Surian dos Santos.</p>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<TradutorTupife />);
+</script>
+</body>
+</html>
